@@ -4,7 +4,9 @@
     {
       "version": "1.23.7",
       "date": "2026-11-08",
-      "prs": [],
+      "prs": [
+        1
+      ],
       "lines": {
         "en": [
           "Malformed requests no longer stop a self-hosted server, and reassigned tasks keep their owners after a restart.",
