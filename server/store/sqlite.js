@@ -103,12 +103,17 @@ export function openSqlite({ file, boardUrl }) {
   db.exec('pragma journal_mode = wal; pragma foreign_keys = on; pragma busy_timeout = 5000;');
   db.exec(SCHEMA);
   // a file made before projects could be archived has no archived_at; create table above leaves an old table as it is
-  if (!db.prepare("select 1 from pragma_table_info('projects') where name = 'archived_at'").get()) db.exec('alter table projects add column archived_at text');
-  // Tasks written before the owner alone held a task, whose claim names someone else: the claimer held it then, so
-  // they own it now and nothing changes hands. Converges: a second open finds nothing to repair.
-  db.prepare(`update docs set data = json_set(data, '$.owner', json_extract(data, '$.claimedBy.who')), version = version + 1
-    where collection = 'tasks' and json_type(data, '$.claimedBy.who') = 'text'
-      and json_extract(data, '$.owner') is not json_extract(data, '$.claimedBy.who')`).run();
+  if (!db.prepare("select 1 from pragma_table_info('projects') where name = 'archived_at'").get()) {
+    // Archiving arrived after owner became the holder. Only an older schema can need that historical repair:
+    // a current task may have been reassigned while its claim still records who originally took it.
+    db.exec('begin immediate');
+    try {
+      db.prepare(`update docs set data = json_set(data, '$.owner', json_extract(data, '$.claimedBy.who')), version = version + 1
+        where collection = 'tasks' and json_type(data, '$.claimedBy.who') = 'text'
+          and json_extract(data, '$.owner') is not json_extract(data, '$.claimedBy.who')`).run();
+      db.exec('alter table projects add column archived_at text; commit');
+    } catch (e) { db.exec('rollback'); db.close(); throw e; }
+  }
   const changes = new EventEmitter();
   changes.setMaxListeners(0);
   const q = (sql) => db.prepare(sql);
@@ -228,6 +233,7 @@ export function openSqlite({ file, boardUrl }) {
         data = { ...JSON.parse(cur.data), ...payload };
       } else throw new BoardError('invalid_argument', 'op must be set, update or delete', i);
       const version = cur ? cur.version + 1 : 1, text = JSON.stringify(data);
+      if (text.length > MAX_DOC) throw new BoardError('invalid_argument', 'the resulting document must be under 256 KiB', i);
       q(`insert into docs (project, collection, doc_id, data, version, created_at, updated_at, updated_by) values (?, ?, ?, ?, ?, ?, ?, ?)
          on conflict (project, collection, doc_id) do update set data = excluded.data, version = excluded.version,
          updated_at = excluded.updated_at, updated_by = excluded.updated_by`).run(project, c, d, text, version, at, at, actor ?? null);

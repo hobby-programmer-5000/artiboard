@@ -207,9 +207,9 @@ export function makeFlow(store) {
 
   // The rest of a query whose first page came back full (200, a page's most), page by page: a list cut short would drop
   // someone's work without saying so. Boards smaller than a page pay nothing.
-  async function rest(project, first, { collection, where }) {
+  async function rest(project, first, { collection, where }, most = 5000) {
     const all = first.slice();
-    for (let page = first; page.length === 200 && all.length < 5000;) {
+    for (let page = first; page.length === 200 && all.length < most;) {
       page = await query(project, collection, { where, limit: 200, after: page[page.length - 1].id });
       all.push(...page);
     }
@@ -506,7 +506,11 @@ export function makeFlow(store) {
   // patch (one write per document); the rest get a write each. unblocked names the todo tasks now waiting on nothing.
   async function unblockDependents(project, keys, patches) {
     const finished = new Set(keys), seen = new Map(), more = [], unblocked = [];
-    for (const found of await Promise.all(keys.map((k) => query(project, 'tasks', { where: [{ field: 'deps', op: 'array-contains', value: k }], limit: 200 })))) {
+    for (const found of await Promise.all(keys.map(async (k) => {
+      const opts = { collection: 'tasks', where: [{ field: 'deps', op: 'array-contains', value: k }] };
+      const first = await query(project, opts.collection, { where: opts.where, limit: 200 });
+      return rest(project, first, opts, Infinity);
+    }))) {
       for (const o of found) seen.set(o.id, o);
     }
     for (const o of seen.values()) {

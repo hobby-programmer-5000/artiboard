@@ -225,9 +225,11 @@ export function makeApp({ store, cfg }) {
 
   // route: a name when Vercel calls one function per route, otherwise found from the URL
   return async function handle(req, res, route) {
-    const url = new URL(req.url, 'http://localhost');
-    const p = url.pathname;
     try {
+      let url;
+      try { url = new URL(req.url, 'http://localhost'); }
+      catch { throw new BoardError('invalid_argument', 'the request URL is invalid'); }
+      const p = url.pathname;
       if (route === 'mcp' || p === '/mcp') return await mcp(req, res);
       if (route === 'page') return await page(res, url.searchParams.get('project'));
       const board = /^\/p\/([^/]+)\/?$/.exec(p);

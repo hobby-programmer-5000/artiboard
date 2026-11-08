@@ -2,6 +2,23 @@
   "repo": "https://github.com/yulmucoffee/artiboard",
   "versions": [
     {
+      "version": "1.23.7",
+      "date": "2026-11-08",
+      "prs": [],
+      "lines": {
+        "en": [
+          "Malformed requests no longer stop a self-hosted server, and reassigned tasks keep their owners after a restart.",
+          "Reconnecting restores deleted tasks and current message lists; large Supabase boards load every document.",
+          "Finishing work updates every dependent; oversized document updates roll back safely, and checks run on Windows."
+        ],
+        "ko": [
+          "잘못된 요청이 자체 호스팅 서버를 멈추지 않고, 재배정한 작업의 담당자가 재시작 후에도 유지돼요.",
+          "다시 연결하면 삭제된 작업과 최신 메시지 목록이 바로잡히고, 큰 Supabase 보드도 모든 문서를 읽어요.",
+          "작업 완료가 모든 의존 작업에 반영돼요. 너무 큰 문서 수정은 안전하게 취소되고, Windows에서도 전체 검사가 실행돼요."
+        ]
+      }
+    },
+    {
       "version": "1.23.6",
       "date": "2026-11-06",
       "prs": [

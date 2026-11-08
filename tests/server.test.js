@@ -8,7 +8,8 @@ import { execFile, execFileSync } from 'node:child_process';
 import { createServer, request } from 'node:http';
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { after, before, describe, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
@@ -586,6 +587,55 @@ for (const backend of backends) {
       assert.equal(w.error, false, JSON.stringify(w.value).slice(0, 200));
     });
 
+    test('an update that makes a document exceed 256 KiB rolls the whole batch back', async () => {
+      const path = `size-${R}/merged`, marker = `size-${R}/marker`;
+      await store.apply(null, P, [{ op: 'set', path, data: { a: 'x'.repeat(200000) } }]);
+      try {
+        const before = await store.get(P, path);
+        const result = await call(board, 'board_batch', { project: P, writes: [
+          { op: 'set', path: marker, data: { kept: false } },
+          { op: 'update', path, if_version: before.version, data: { b: 'y'.repeat(200000) } },
+        ] });
+        assert.equal(result.error, true);
+        assert.equal(result.value.code, 'invalid_argument');
+        assert.equal(result.value.index, 1);
+        assert.equal((await store.get(P, path)).version, before.version);
+        assert.deepEqual((await store.get(P, path)).data, before.data);
+        assert.equal(await store.get(P, marker), null, 'the preceding write was rolled back');
+      } finally { await store.apply(null, P, [{ op: 'delete', path }, { op: 'delete', path: marker }]); }
+    });
+
+    if (backend.name === 'supabase') test('the browser runtime reads beyond the real Supabase row cap as a signed-in member', async () => {
+      const collection = `page-${R}`, ids = [...Array.from({ length: 1005 }, (_, n) => `T-${String(n).padStart(4, '0')}`), 'z"last'];
+      const sdk = { fetch, URL, Headers, Request, Response, WebSocket, AbortController, TextEncoder, TextDecoder,
+        atob, btoa, setTimeout, clearTimeout, setInterval, clearInterval, crypto: globalThis.crypto };
+      runInNewContext(readFileSync(new URL('../server/public/vendor/supabase-2.117.2.js', import.meta.url), 'utf8'), sdk);
+      const client = sdk.supabase.createClient(cfg.supabase.url, cfg.supabase.publishableKey, { auth: { persistSession: false, autoRefreshToken: false } });
+      try {
+        for (let i = 0; i < ids.length; i += 100) await store.apply(null, P,
+          ids.slice(i, i + 100).map((id) => ({ op: 'set', path: `${collection}/${id}`, data: { key: id } })));
+        const link = new URL(await store.loginLink(people.member));
+        const signed = await client.auth.verifyOtp({ token_hash: link.searchParams.get('token'), type: 'magiclink' });
+        assert.equal(signed.error, null, signed.error?.message);
+        const channel = { on() { return this; }, subscribe() { return this; } };
+        const sb = { auth: client.auth, from: (...a) => client.from(...a), rpc: (...a) => client.rpc(...a), channel: () => channel };
+        const window = { supabase: { createClient: () => sb }, addEventListener() {} };
+        runInNewContext(readFileSync(new URL('../server/public/shim.js', import.meta.url), 'utf8'), {
+          window, setTimeout, clearTimeout, setInterval: () => 0,
+          document: { addEventListener() {}, getElementById: () => null },
+          location: { pathname: `/p/${P}`, hash: '', search: '' }, history: { replaceState() {} },
+          fetch: async () => ({ json: async () => ({ backend: 'supabase', lang: 'en', supabaseUrl: cfg.supabase.url, supabaseKey: cfg.supabase.publishableKey }) }),
+        });
+        const db = await window.claude.use('db');
+        const found = await db.collection(collection).get();
+        assert.equal(found.docs.length, ids.length);
+        assert.deepEqual(Array.from(found.docs, (d) => d.id).sort(), ids.slice().sort());
+      } finally {
+        await client.auth.signOut({ scope: 'local' });
+        for (let i = 0; i < ids.length; i += 100) await store.apply(null, P, ids.slice(i, i + 100).map((id) => ({ op: 'delete', path: `${collection}/${id}` })));
+      }
+    });
+
     // what an agent reads stays in its context for the rest of the session, so routine answers stay small
     test('tasks list by key, title, status and owner; a brief task leaves out its details; a page reads a part at a time', async () => {
       const at = new Date().toISOString(), k = K('lean');
@@ -629,17 +679,24 @@ for (const backend of backends) {
       await call(board, 'board_batch', { project: P, writes: [{ op: 'delete', path: `tasks/${K('o1')}` }], override: true });
     });
 
-    test('a task whose claim names someone other than its owner belongs to the claimer once the store opens', async (t) => {
+    test('an old SQLite schema repairs legacy owners once, and later reassignments survive reopening', async (t) => {
       if (store.kind !== 'sqlite') return t.skip('the Supabase migration repairs the same once');
-      const path = `tasks/${K('legacy')}`;
-      await store.apply(null, P, [{ op: 'set', path, data: { key: K('legacy'), title: 'legacy', status: 'doing', owner: people.member.person, claimedBy: { who: people.admin.person, agent: true } } }]);
-      const again = await openSqlite({ file: join(dir, 'board.db'), boardUrl: BASE });
+      const path = 'tasks/T-1', file = join(dir, 'legacy.db');
+      const seeded = openSqlite({ file, boardUrl: BASE });
+      await seeded.createProject(null, { id: 'legacy', title: 'Legacy' });
+      await seeded.apply(null, 'legacy', [{ op: 'set', path, data: { key: 'T-1', status: 'doing', owner: 'ben', claimedBy: { who: 'ana', agent: true } } }]);
+      seeded.close();
+      const old = new DatabaseSync(file);
+      old.exec('alter table projects drop column archived_at');
+      old.close();
+      const again = openSqlite({ file, boardUrl: BASE });
       try {
-        assert.equal((await again.get(P, path)).data.owner, people.admin.person, 'the claimer held it before, so nothing changes hands');
-      } finally {
-        again.close();
-        await store.apply(null, P, [{ op: 'delete', path }]);
-      }
+        assert.equal((await again.get('legacy', path)).data.owner, 'ana', 'the historical upgrade preserves the old holder');
+        await again.apply(null, 'legacy', [{ op: 'update', path, data: { owner: 'ben' } }]);
+      } finally { again.close(); }
+      const current = openSqlite({ file, boardUrl: BASE });
+      try { assert.equal((await current.get('legacy', path)).data.owner, 'ben', 'the schema upgrade is not repeated'); }
+      finally { current.close(); }
     });
 
     test('a claim or a post that loses a race rereads and decides again', async () => {
@@ -953,7 +1010,7 @@ for (const backend of backends) {
     });
 
     test('a task with more dependents than one write takes still finishes, and every dependent hears it', async () => {
-      const X = `hub-${R}`, at = new Date().toISOString(), n = 120;
+      const X = `hub-${R}`, at = new Date().toISOString(), n = 205;
       await store.createProject(null, { id: X, title: 'Hub', lang: 'en' });
       try {
         const task = (key, deps) => ({ op: 'set', path: `tasks/${key}`, data: { key, title: key, status: 'todo', deps, waitingOn: deps, updatedAt: at } });
@@ -1269,10 +1326,11 @@ for (const backend of backends) {
       const id = `${name}-${R}`, root = mkdtempSync(join(tmpdir(), 'artiboard-repo-')), bin = mkdtempSync(join(tmpdir(), 'artiboard-bin-'));
       t.after(async () => {
         await store.dropProject(null, id).catch(() => {});
-        for (const d of [root, bin]) rmSync(d, { recursive: true, force: true });
+        for (const d of [root, bin]) rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
       });
-      symlinkSync(process.execPath, join(bin, 'node'));
-      const env = { ...process.env, PATH: `${bin}:${process.env.PATH}` };
+      const nodePath = join(bin, process.platform === 'win32' ? 'node.exe' : 'node');
+      symlinkSync(process.execPath, nodePath);
+      const env = { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH}` };
       delete env.ARTIBOARD_TOKEN;
       const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
       // not execFileSync: a commit runs the hooks, and this process's own server must answer their upload
@@ -1292,7 +1350,7 @@ for (const backend of backends) {
       await run('commit', '-q', '-m', 'x');
       const gitDir = git('rev-parse', '--absolute-git-dir');
       const hooks = Object.fromEntries(['post-commit', 'post-merge', 'post-rewrite'].map((h) => [h, join(gitDir, 'hooks', h)]));
-      return { id, root, bin, env, git, run, hook, mapped, settled, gitDir, hooks, envFile: join(gitDir, 'artiboard-codemap.env') };
+      return { id, root, bin, nodePath, env, git, run, hook, mapped, settled, gitDir, hooks, envFile: join(gitDir, 'artiboard-codemap.env') };
     }
     const markedLine = (file) => readFileSync(file, 'utf8').split('\n').find((l) => l.endsWith('# artiboard code map'));
 
@@ -1315,8 +1373,10 @@ for (const backend of backends) {
       assert.equal(installed[0], `#!/bin/sh\n${line}\n${own}`, 'the marked line follows the #! line, so a hook that exits early runs it too');
       assert.equal(installed[1], `#!/bin/sh\n${line}\necho merged\n`, 'a hook with no #! line gets one');
       assert.match(line, /^\( .* --if-changed >> .* 2>&1 & \) # artiboard code map$/, 'one marked line runs the uploader in the background');
-      for (const f of files) assert.ok(statSync(f).mode & 0o100, `${f} is executable`);
-      assert.equal(statSync(repo.envFile).mode & 0o777, 0o600, 'the token file is its owner\'s alone');
+      if (process.platform !== 'win32') {
+        for (const f of files) assert.ok(statSync(f).mode & 0o100, `${f} is executable`);
+        assert.equal(statSync(repo.envFile).mode & 0o777, 0o600, 'the token file is its owner\'s alone');
+      }
       assert.equal(readFileSync(repo.envFile, 'utf8'), `ARTIBOARD_TOKEN=${tokens.member}\n`);
       assert.match(await repo.hook(), /^up to date: /m, 'installing again builds nothing new');
       assert.deepEqual(files.map((f) => readFileSync(f, 'utf8')), installed, 'and changes no hook');
@@ -1369,13 +1429,13 @@ for (const backend of backends) {
     test('--hook names the node it found on PATH, so a hook that git runs with another PATH still builds', async (t) => {
       const repo = await hookCheckout(t, 'hook-node');
       await repo.hook();
-      assert.ok(markedLine(repo.hooks['post-commit']).includes(`; ${join(repo.bin, 'node')} ${UPLOADER} --site `),
+      assert.ok(markedLine(repo.hooks['post-commit']).includes(repo.nodePath),
         'the PATH entry, not process.execPath, which a package manager may point at one version\'s folder');
       // a GUI git client or a shell without the version manager: the first node on PATH is not one that works
       const broken = join(repo.bin, 'broken');
       mkdirSync(broken);
       writeFileSync(join(broken, 'node'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
-      repo.env.PATH = `${broken}:${process.env.PATH}`;
+      repo.env.PATH = `${broken}${delimiter}${process.env.PATH}`;
       writeFileSync(join(repo.root, 'units.js'), 'export function toCents(amount) {\n  return Math.round(amount * 1000) / 10;\n}\n');
       await repo.run('commit', '-q', '-am', 'x');
       const want = repo.git('rev-parse', 'HEAD');
@@ -1637,7 +1697,7 @@ for (const backend of backends) {
         mkdirSync(empty, { recursive: true });
         const wrong = await cli('map', 'build', '--project', id, '--repo', SHOP_REPO, '--root', empty).catch((e) => e);
         assert.equal(wrong.code, 1, 'a wrong --root fails');
-        assert.match(wrong.stderr, new RegExp(`no files: is ${empty.replace(/[/.]/g, '\\$&')} the repository's root\\?`));
+        assert.match(wrong.stderr, new RegExp(`no files: is ${literal(empty)} the repository's root\\?`));
         assert.equal(await store.get(id, `map/acme-${R}--shop`), null, 'and writes nothing');
         const help = await cli('map').catch((e) => e);
         assert.match(help.stderr, /^usage: artiboard map /);
@@ -1997,9 +2057,8 @@ test('a page reads again a listener whose first read failed', async () => {
   assert.equal(seen[seen.length - 1], 's2', 'then the document arrives, with the change pushed while it waited');
 });
 
-// Supabase stamps a row with its transaction's start, so a write that commits after a later one can carry the earlier
-// stamp; catching up after a gap asks from a little before the newest stamp seen, and versions drop what came twice
-test('a page catching up gets a row committed late with an earlier stamp', async () => {
+// Reconciliation reads the current snapshot, so a transaction committed late is included even with an earlier stamp.
+test('a page reconnecting gets a row committed late with an earlier stamp', async () => {
   let visible = null;
   const json = (status, body) => Promise.resolve({ ok: status < 300, status, json: async () => body });
   const row = (id, at) => ({ collection: 'tasks', doc_id: id, version: 1, updated_at: at, data: { key: id } });
