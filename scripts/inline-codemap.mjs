@@ -111,7 +111,7 @@ async function codemapWorkflow({ site, project, repo, label, root }) {
 // The node this shell finds, named in the hooks: GUI git clients, and shells that set up a version manager in a
 // profile, run hooks with another PATH. The PATH entry, not process.execPath, which a package manager may resolve to
 // one version's folder that an upgrade removes.
-const codemapNode = () => (process.env.PATH || '').split(delimiter).map((d) => join(d, 'node')).find((at) => {
+const codemapNode = () => (process.env.PATH || '').split(delimiter).map((d) => join(d, process.platform === 'win32' ? 'node.exe' : 'node')).find((at) => {
   try { accessSync(at, constants.X_OK); return isAbsolute(at) && statSync(at).isFile(); } catch { return false; }
 }) || process.execPath;
 // whether a hook's #! line names a shell, directly or through env, so that the sh line can go in it

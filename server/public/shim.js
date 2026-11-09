@@ -91,7 +91,6 @@
       plain: function (whole, docs) { return call('read', { whole: whole, docs: docs }); },
       limited: function (collection, orders, lim) { return call('read', { collection: collection, order: orders, limit: lim }); },
       limitedMany: function (reads) { return call('read', { limited: reads }); },
-      changed: function (collections, since) { return call('read', { collections: collections, since: since }); },
       batch: function (writes) { return call('batch', { writes: writes }); },
       subscribe: function (onRow, onLive) {
         var es = new EventSource(base + 'events');
@@ -108,13 +107,28 @@
     function jsonPath(field) { return 'data->' + field.split('.').join('->'); }
     function rows(r) { if (r.error) throw r.error; return r.data; }
     function base() { return sb.from('ab_docs').select(COLS).eq('project', PROJECT); }
+    // The service may cap a response below the requested limit. Continue by the unique row identity until empty,
+    // rather than treating a short page as complete or using offsets that shift when another row is deleted.
+    function allRows(build) {
+      var out = [], last = null;
+      function next() {
+        var x = build().order('collection', { ascending: true }).order('doc_id', { ascending: true }).limit(1000);
+        if (last) x = x.or('collection.gt.' + q(last.collection) + ',and(collection.eq.' + q(last.collection) + ',doc_id.gt.' + q(last.doc_id) + ')');
+        return x.then(rows).then(function (page) {
+          if (!page.length) return out;
+          out = out.concat(page); last = page[page.length - 1];
+          return next();
+        });
+      }
+      return next();
+    }
     return {
       plain: function (whole, docs) {
         var parts = whole.map(function (c) { return 'collection.eq.' + q(c); });
         Object.keys(docs).forEach(function (c) {
           if (whole.indexOf(c) < 0) parts.push('and(collection.eq.' + q(c) + ',doc_id.in.(' + docs[c].map(q).join(',') + '))');
         });
-        return base().or(parts.join(',')).then(rows);
+        return allRows(function () { return base().or(parts.join(',')); });
       },
       limited: function (collection, orders, lim) {
         var x = base().eq('collection', collection);
@@ -122,7 +136,6 @@
         return x.order('doc_id', { ascending: true }).limit(lim).then(rows);
       },
       limitedMany: function (reads) { return sb.rpc('ab_read_limited', { p_project: PROJECT, p_reads: reads }).then(rows); },
-      changed: function (collections, since) { return base().in('collection', collections).gt('updated_at', since).then(rows); },
       batch: function (writes) { return sb.rpc('ab_batch', { p_project: PROJECT, p_writes: writes }).then(rows); },
       // shows(row): whether anything on the page shows that row
       subscribe: function (onRow, onLive, shows) {
@@ -154,11 +167,11 @@
 
   // Reads are shaped for a live page that should cost little:
   // - listeners registered together are fetched together: every unlimited listener in one request, each limited one apart
-  // - after that, pushed rows are applied in place; nothing is re-read on a change
-  // - a reconnect or a return to the tab asks only for rows changed since the newest one seen
-  // - after a long absence everything is read again once, which also catches deletes that were missed
+  // - full listeners merge pushed rows; limited windows refill when their membership or order can change
+  // - a reconnect or a return to the tab reconciles watched snapshots, including deletes missed in the gap
+  // - while disconnected, the same reconciliation runs once a minute
   function makeDb(tr) {
-    var listeners = [], queued = [], mark = '', live = false, hiddenAt = 0, statusCbs = [], catching = false;
+    var listeners = [], queued = [], live = false, statusCbs = [];
 
     function cmp(orders) {
       return function (a, b) {
@@ -174,8 +187,6 @@
         return a.doc_id < b.doc_id ? -1 : a.doc_id > b.doc_id ? 1 : 0;
       };
     }
-    // Supabase realtime may send timestamps without a zone; they are UTC
-    function stamp(at) { if (typeof at !== 'string') return; var t = Date.parse(/[zZ]|[+-]\d\d:?\d\d$/.test(at) ? at : at + 'Z'); if (!isNaN(t)) { var s = new Date(t).toISOString(); if (s > mark) mark = s; } }
     function emit(l) {
       l.rows.sort(cmp(l.orders));
       if (l.lim && l.rows.length > l.lim) l.rows.length = l.lim;
@@ -186,7 +197,6 @@
     }
     function matches(l, row) { return l.collection === row.collection && (l.docId == null || l.docId === row.doc_id); }
     function applyRow(row, gone) {
-      stamp(row.updated_at);
       listeners.forEach(function (l) {
         if (!matches(l, row)) return;
         // not read yet: keep it for when the first read lands, which may be older
@@ -196,14 +206,19 @@
     }
     function merge(l, row, gone) {
       var i = l.rows.findIndex(function (r) { return r.doc_id === row.doc_id; });
+      if (l.lim) {
+        if ((gone && i < 0) || (!gone && i >= 0 && l.rows[i].version >= row.version)) return;
+        refill(l);
+        return;
+      }
       if (gone) { if (i < 0) return; l.rows.splice(i, 1); }
       else if (i >= 0) { if (l.rows[i].version >= row.version) return; l.rows[i] = row; }
       else l.rows.push(row);
       // rows of one batch arrive one by one: hand the listener one snapshot for all of them
       if (!l.soon) l.soon = setTimeout(function () { l.soon = 0; if (listeners.indexOf(l) >= 0) emit(l); }, 30);
     }
-    function first(l, rows) {
-      if (listeners.indexOf(l) < 0) return;
+    function first(l, rows, read) {
+      if (listeners.indexOf(l) < 0 || l.read !== read) return;
       l.rows = rows;
       var p = l.pending; l.pending = [];
       p.forEach(function (x) {
@@ -213,46 +228,61 @@
         else if (l.rows[i].version < x.row.version) l.rows[i] = x.row;
       });
       emit(l);
+      if (l.lim && p.length) refill(l);
     }
 
-    function fail(ls, e) { ls.forEach(function (l) { l.failed = true; if (l.err) l.err(boardError(e)); }); }
+    function refill(l) {
+      if (!l.refill) l.refill = setTimeout(function () {
+        l.refill = 0;
+        if (listeners.indexOf(l) >= 0) load([l]);
+      }, 30);
+    }
+    function fail(ls, reads, e) { ls.forEach(function (l, i) {
+      if (listeners.indexOf(l) < 0 || l.read !== reads[i]) return;
+      l.failed = true; if (l.err) l.err(boardError(e));
+    }); }
     // a first read that failed is read again when the connection comes back and every minute; what arrived for it
     // meanwhile waits in pending and lands with that read
     function retry() {
       var ls = listeners.filter(function (l) { return l.failed && !l.ready; });
       ls.forEach(function (l) { l.failed = false; });
-      if (ls.length) load(ls);
+      if (ls.length) load(ls, true);
     }
     // one request for the unlimited listeners: whole collections, or single documents of a collection
     function fetchPlain(ls) {
       if (!ls.length) return;
-      var whole = [], docs = {};
+      var whole = [], docs = {}, reads = ls.map(function (l) { return l.read; });
       ls.forEach(function (l) {
         if (l.docId == null) { if (whole.indexOf(l.collection) < 0) whole.push(l.collection); }
         else { docs[l.collection] = docs[l.collection] || []; if (docs[l.collection].indexOf(l.docId) < 0) docs[l.collection].push(l.docId); }
       });
       tr.plain(whole, docs).then(function (rows) {
-        rows.forEach(function (row) { stamp(row.updated_at); });
-        ls.forEach(function (l) { first(l, rows.filter(function (row) { return matches(l, row); })); });
-      }, function (e) { fail(ls, e); });
+        ls.forEach(function (l, i) { first(l, rows.filter(function (row) { return matches(l, row); }), reads[i]); });
+      }, function (e) { fail(ls, reads, e); });
     }
     function fetchLimited(l) {
+      var read = l.read;
       tr.limited(l.collection, l.orders, l.lim).then(function (rows) {
-        rows.forEach(function (row) { stamp(row.updated_at); });
-        first(l, rows);
-      }, function (e) { fail([l], e); });
+        first(l, rows, read);
+      }, function (e) { fail([l], [read], e); });
     }
     // the limited listeners that start together (recent activity: one per task) share one request
     function fetchLimitedMany(ls) {
       for (var k = 0; k < ls.length; k += 20) (function (part) {
+        var reads = part.map(function (l) { return l.read; });
         tr.limitedMany(part.map(function (l) { return { collection: l.collection, order: l.orders, limit: l.lim }; })).then(function (rows) {
           var by = part.map(function () { return []; });
-          rows.forEach(function (row) { stamp(row.updated_at); if (by[row.i]) by[row.i].push(row); });
-          part.forEach(function (l, i) { first(l, by[i]); });
-        }, function (e) { fail(part, e); });
+          rows.forEach(function (row) { if (by[row.i]) by[row.i].push(row); });
+          part.forEach(function (l, i) { first(l, by[i], reads[i]); });
+        }, function (e) { fail(part, reads, e); });
       })(ls.slice(k, k + 20));
     }
-    function load(ls) {
+    function load(ls, keepPending) {
+      ls = ls.filter(function (l) { return listeners.indexOf(l) >= 0; });
+      ls.forEach(function (l) {
+        l.read = (l.read || 0) + 1; l.ready = false; l.failed = false;
+        if (!keepPending) l.pending = [];
+      });
       fetchPlain(ls.filter(function (l) { return !l.lim; }));
       var lim = ls.filter(function (l) { return l.lim; });
       if (lim.length > 1 && tr.limitedMany) fetchLimitedMany(lim);
@@ -265,32 +295,21 @@
       if (queued.length === 1) Promise.resolve().then(function () { var ls = queued; queued = []; load(ls); });
       return function () { listeners = listeners.filter(function (x) { return x !== l; }); };
     }
-    // rows of the watched collections changed since a little before the newest one seen: Supabase stamps a row with
-    // its transaction's start, so a write that commits after a later one can carry the earlier stamp. A row that
-    // comes twice is dropped by its version.
-    function catchUp() {
-      if (!mark || !listeners.length || catching) return;
-      catching = true;
-      var cols = listeners.map(function (l) { return l.collection; }).filter(function (c, i, a) { return a.indexOf(c) === i; });
-      tr.changed(cols, new Date(Date.parse(mark) - 30000).toISOString()).then(function (rows) { catching = false; rows.forEach(function (row) { applyRow(row); }); }, function () { catching = false; });
-    }
     function setLive(on) {
-      if (on) { retry(); catchUp(); }
       if (live === on) return;
       live = on;
+      if (on) load(listeners.slice());
       statusCbs.forEach(function (cb) { cb(on); });
     }
     tr.subscribe(applyRow, setLive, function (row) { return listeners.some(function (l) { return matches(l, row); }); });
     document.addEventListener('visibilitychange', function () {
-      if (document.hidden) { hiddenAt = Date.now(); return; }
-      if (hiddenAt && Date.now() - hiddenAt > 30 * 60000) { listeners.forEach(function (l) { l.ready = false; l.pending = []; }); load(listeners.slice()); }
-      else { retry(); catchUp(); }
+      if (!document.hidden) load(listeners.slice());
     });
     // while the live connection is down, look for changes every minute instead
     setInterval(function () {
       if (document.hidden) return;
-      retry();
-      if (!live) catchUp();
+      if (live) retry();
+      else load(listeners.slice(), true);
     }, 60000);
 
     // A write shows at once: listeners get the changed document before the server answers, keeping its old version so

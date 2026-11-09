@@ -3,22 +3,23 @@
 import { spawnSync } from 'node:child_process';
 
 const steps = [
-  ['the version is stamped where agents read it', 'node', ['scripts/stamp-version.mjs', '--check']],
-  ['nothing defined and unused (page functions, UI strings, server exports)', 'node', ['scripts/unused.mjs']],
-  ['READMEs share one shape', 'node', ['scripts/readme-shape.mjs']],
-  ['the page carries the current task rules', 'node', ['scripts/inline-rules.mjs', '--check']],
-  ['the page scripts keep their shape', 'node', ['scripts/page-shape.mjs', '--check']],
-  ['the page carries the current code map graph', 'node', ['scripts/inline-graph.mjs', '--check']],
-  ['the skill script is built from the current code map modules', 'node', ['scripts/inline-codemap.mjs', '--check']],
-  ['the demo still builds from the current page', 'node', ['examples/build-demo.cjs', '--check']],
-  ['server, MCP and changelog tests', 'npm', ['test', '--silent']],
-  ['the board page in a browser-like DOM', 'node', ['tests/smoke.cjs']],
+  ['the version is stamped where agents read it', ['scripts/stamp-version.mjs', '--check']],
+  ['nothing defined and unused (page functions, UI strings, server exports)', ['scripts/unused.mjs']],
+  ['READMEs share one shape', ['scripts/readme-shape.mjs']],
+  ['the page carries the current task rules', ['scripts/inline-rules.mjs', '--check']],
+  ['the page scripts keep their shape', ['scripts/page-shape.mjs', '--check']],
+  ['the page carries the current code map graph', ['scripts/inline-graph.mjs', '--check']],
+  ['the skill script is built from the current code map modules', ['scripts/inline-codemap.mjs', '--check']],
+  ['the demo still builds from the current page', ['examples/build-demo.cjs', '--check']],
+  ['server, MCP and changelog tests', ['--test', 'tests/*.test.js']],
+  ['the board page in a browser-like DOM', ['tests/smoke.cjs']],
 ];
-for (const [name, cmd, args] of steps) {
-  const r = spawnSync(cmd, args, { stdio: 'pipe', encoding: 'utf8' });
+for (const [name, args] of steps) {
+  const r = spawnSync(process.execPath, args, { stdio: 'pipe', encoding: 'utf8' });
   if (r.status !== 0) {
     process.stdout.write(r.stdout || '');
     process.stderr.write(r.stderr || '');
+    if (r.error) console.error(r.error.message);
     console.error(`\ncheck failed: ${name}`);
     process.exit(1);
   }
